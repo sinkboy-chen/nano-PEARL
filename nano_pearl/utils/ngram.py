@@ -20,7 +20,7 @@ def ngram_next_token(token_ids: list[int], max_n: int) -> Optional[int]:
     return None
 
 
-def draft_by_ngram(seq: Sequence, ngram_n: int, max_draft_len: int) -> None:
+def draft_by_ngram(seq: Sequence, ngram_n: int, max_draft_len: int) -> int:
     """
     Generate draft tokens for a sequence using n-gram repetition.
 
@@ -29,8 +29,11 @@ def draft_by_ngram(seq: Sequence, ngram_n: int, max_draft_len: int) -> None:
         ngram_n: Maximum n-gram length to consider.
         max_draft_len: Maximum number of tokens to draft.
     """
+    draft_token_count = 0
     for _ in range(max_draft_len):
         next_token = ngram_next_token(seq.token_ids, ngram_n)
         if next_token is None:
             break
         seq.append_token(next_token)
+        draft_token_count += 1
+    return draft_token_count
