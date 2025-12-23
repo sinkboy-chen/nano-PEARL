@@ -30,7 +30,9 @@ class Sequence:
         self.pre_verify = True
         self.num_acc_tokens = []
         self.cur_acc_tokens = 0
-
+        self.prev_drafted_tokens = 0
+        self.cur_drafted_tokens = 0
+        
     def __len__(self):
         return self.num_tokens
 

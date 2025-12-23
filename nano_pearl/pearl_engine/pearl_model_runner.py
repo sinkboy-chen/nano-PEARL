@@ -19,6 +19,7 @@ from nano_pearl.pearl_engine.scheduler import Scheduler, is_eos
 from nano_pearl.pearl_engine.sequence import SequenceStatus
 from transformers import AutoTokenizer
 from tqdm import trange
+from nano_pearl.utils.ngram import draft_by_ngram
 
 
 class ModelRunnerBase:
@@ -41,6 +42,10 @@ class ModelRunnerBase:
         self.tensor_parallel_size = self.group_config.tensor_parallel_size
         self.group_name = self.group_config.group_name
         self.gamma = self.global_config.gamma
+
+        self.ngram_speedup_drafting = self.global_config.ngram_speedup_drafting
+        self.ngram_n = self.global_config.ngram_n if self.ngram_speedup_drafting else None
+        self.max_ngram_draft_tokens = self.global_config.max_ngram_draft_tokens if self.ngram_speedup_drafting else None
 
         self.init_dist()
         self.init_model_and_kvcache()
@@ -488,8 +493,32 @@ class DraftModelRunner(ModelRunnerBase):
 
     def prepare_pearl_decode(self, seqs: list[Sequence]):
         return super().prepare_decode(seqs)
+
+    def prepare_pearl_decode_ngram(self, seqs: list[Sequence], new_token_counts: list[int]):
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        temp_seqs = []
+        for seq, num_tokens in zip(seqs, new_token_counts):
+            # 1 previous generated token + k ngram predicted k tokens
+            # thus, +1
+            num_tokens += 1 
+            to_append_tokens = seq.token_ids[-num_tokens:]
+            input_ids.extend(to_append_tokens)
+            positions.extend(list(range(len(seq) - num_tokens, len(seq))))
+            context_lens.extend(list(range(len(seq) - num_tokens + 1, len(seq) + 1)))
+            slot_mapping.extend([seq.token_to_slot(token_index) for token_index in range(len(seq) - num_tokens, len(seq))])
+            temp_seqs.extend([seq] * num_tokens)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(temp_seqs)
+        set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
     
-    def pearl_step(self):
+    def draft_without_ngram_speedup(self) -> list[Sequence]:
         for _ in range(self.gamma):
             seqs, is_prefill = self.scheduler.schedule()
             assert not is_prefill, "wrong match. current stage is prefill."
@@ -505,8 +534,66 @@ class DraftModelRunner(ModelRunnerBase):
             # append the sample tokens to the seqs. Do not use postprocess to avoid early exiting when the draft tokens contain EOS.
             for seq, token_id in zip(seqs, token_ids):
                 seq.append_token(token_id)
+        return seqs
 
-        self.verify(seqs)
+    def draft_with_ngram_speedup(self):
+        for cycle in range(self.gamma):
+            seqs, is_prefill = self.scheduler.schedule()
+
+            # record down total drafted tokens over gamma cycles
+            # as this could be different for every sequence
+            if cycle==0:
+                for seq in seqs:
+                    seq.prev_drafted_tokens = seq.cur_drafted_tokens
+                    seq.cur_drafted_tokens = 0
+
+            assert not is_prefill, "wrong match. current stage is prefill."
+            new_token_counts = []
+            for seq in seqs:
+                new_token_counts.append(draft_by_ngram(seq))
+            input_ids, positions = self.prepare_pearl_decode_ngram(seqs, new_token_counts)
+            logits = self.run_model(input_ids, positions, is_prefill)
+            # Currently, the temperature of the draft model is set to 0 to avoid communication overhead.
+            # We will support temperature in the future.
+            sample_tokens = logits.argmax(dim=-1) if self.tp_params.local_rank == 0 else torch.zeros(len(seqs), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            dist.broadcast(sample_tokens, src=self.tp_params.master_rank, group=self.group)
+            token_ids = sample_tokens.tolist()
+            reset_context(self.tp_params)
+
+            # rollback until the last correct token
+            # and add one more decoded token
+            token_ids_idx = 0
+            for seq_idx, seq in enumerate(seqs):
+                draft_len = new_token_counts[seq_idx]
+                mismatch_idx = None
+
+                for i in range(draft_len):
+                    target = token_ids[token_ids_idx + i]
+                    predicted = seq[-draft_len + i]
+                    if target != predicted:
+                        mismatch_idx = i
+                        break
+
+                if mismatch_idx is not None:
+                    self.scheduler.rollback(seq, draft_len - mismatch_idx)
+                    seq.append_token(token_ids[token_ids_idx + mismatch_idx])
+                    seq.cur_drafted_tokens += mismatch_idx + 1
+                else:
+                    # could be all correct or draft_len==0
+                    seq.append_token(token_ids[token_ids_idx + draft_len])
+                    seq.cur_drafted_tokens += draft_len + 1
+                
+                token_ids_idx += draft_len + 1
+        return seqs
+
+    def pearl_step(self):
+        if self.ngram_speedup_drafting:
+            seqs = self.draft_without_ngram()
+            self.verify(seqs)
+        else:
+            seqs = self.draft_with_ngram_speedup()
+            self.verify_ngram(seqs)
+
 
     @torch.inference_mode()
     def verify(self, seqs: list[Sequence]):
@@ -552,6 +639,63 @@ class DraftModelRunner(ModelRunnerBase):
                         self.scheduler.rollback(seq, rollout[idx] - 1)
                     seq.append_token(revise_token[idx])
 
+        
+    @torch.inference_mode()
+    def verify_ngram(self, seqs: list[Sequence]):
+        if self.tp_params.local_rank == 0:
+            to_be_verified_len = []
+            to_be_verified_tokens = []
+            next_round_len = []
+            next_round_input = []
+            for seq in seqs:
+                if seq.pre_verify:
+                    to_be_verified_tokens.append(seq.token_ids[-seq.cur_drafted_tokens])
+                    to_be_verified_len.append(1)
+                else:
+                    to_be_verified_tokens.extend(seq.token_ids[
+                        -seq.prev_drafted_tokens-seq.cur_drafted_tokens+1,
+                        -seq.cur_drafted_tokens+1
+                    ])
+                    to_be_verified_len.append(seq.prev_drafted_tokens)
+                next_round_input.extend(seq.token_ids[-seq.cur_drafted_tokens:])
+                next_round_len.append(seq.cur_drafted_tokens)
+            # send lengths
+            lengths = torch.tensor(to_be_verified_len + next_round_len, dtype=torch.int32, device="cuda")
+            dist.broadcast(lengths, src=self.rank, group=self.verify_group)
+            # send msg
+            msg = torch.tensor(to_be_verified_tokens + next_round_input, dtype=torch.int64, device="cuda")
+            dist.broadcast(msg, src=self.rank, group=self.verify_group)
+
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+        
+        # post-process the seqs according to the verify_res.
+        acc, rollout, revise_token, finish = verify_res.tolist()
+        for idx, seq in enumerate(seqs):
+            if finish[idx]:
+                seq.status = SequenceStatus.FINISHED
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                continue
+            
+            if seq.pre_verify:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, seq.cur_drafted_tokens)
+                    seq.append_token(revise_token[idx])
+            else:
+                if acc[idx]:
+                    seq.pre_verify = False
+                else:
+                    seq.pre_verify = True
+                    self.scheduler.rollback(seq, seq.cur_drafted_tokens)
+                    if rollout[idx] > 1:
+                        self.scheduler.rollback(seq, rollout[idx] - 1)
+                    seq.append_token(revise_token[idx])
+
 
 class TargetModelRunner(ModelRunnerBase):
     def __init__(self, config: PEARLConfig, rank: int, event: Event, control_event: Event):
@@ -587,13 +731,49 @@ class TargetModelRunner(ModelRunnerBase):
         set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions, temp_seqs
 
+    def prepare_pearl_decode_ngram(self, seqs: list[Sequence]):
+        """
+        Behavior of the target model pre-processing.
+        For a sequence in pre-verify, the input tokens are the last token (1 token).
+        For a sequence in post-verify, the input tokens are the last seq.cur_drafted_tokens. (seq.cur_drafted_tokens)
+        To conduct efficient batching inference, we pack all the input tokens together. 
+        Viewing each token as an independent sample, and use slot_mapping and context_lens to instruct the attention network to use correct KV cache.
+        Note that the num of input tokens is not equal to the num of seqs.
+        """
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        temp_seqs = []
+        for seq in seqs:
+            num_tokens = seq.cur_drafted_tokens if not seq.pre_verify else 1
+            to_append_tokens = seq.token_ids[-num_tokens:]
+            input_ids.extend(to_append_tokens)
+            positions.extend(list(range(len(seq) - num_tokens, len(seq))))
+            context_lens.extend(list(range(len(seq) - num_tokens + 1, len(seq) + 1)))
+            slot_mapping.extend([seq.token_to_slot(token_index) for token_index in range(len(seq) - num_tokens, len(seq))])
+            temp_seqs.extend([seq] * num_tokens)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(temp_seqs)
+        set_context(self.tp_params, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions, temp_seqs
+
     def pearl_step(self):
         seqs, is_prefill = self.scheduler.schedule()
         assert not is_prefill, "wrong match. current stage is prefill."
-        input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        if not self.ngram_speedup_drafting:
+            input_ids, positions, temp_seqs = self.prepare_pearl_decode(seqs)
+        else:
+            input_ids, positions, temp_seqs = self.prepare_pearl_decode_ngram(seqs)
         temperatures = self.prepare_sample(temp_seqs) if self.tp_params.local_rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        self.verify(logits, seqs, temperatures)
+        if not self.ngram_speedup_drafting:
+            self.verify(logits, seqs, temperatures)
+        else:
+            self.verify_ngram(logits, seqs, temperatures)
 
     @torch.inference_mode()
     def verify(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
@@ -678,6 +858,120 @@ class TargetModelRunner(ModelRunnerBase):
                 if acc[idx]:
                     seq.pre_verify = False
                     for token in next_round_input[self.gamma * idx:self.gamma * (idx + 1)]:
+                        seq.append_token(token)
+                else:
+                    seq.pre_verify = True
+                    if rollout[idx] > 1:
+                        self.scheduler.rollback(seq, rollout[idx] - 1)
+                    seq.append_token(revise_token[idx])        
+        
+            if finish[idx]:
+                seq.status = SequenceStatus.FINISHED
+                seq.num_acc_tokens.append(seq.cur_acc_tokens)
+                self.scheduler.block_manager.deallocate(seq)
+                self.scheduler.running.remove(seq)
+                self.scheduler.finished.append(seq)
+                continue
+
+    @torch.inference_mode()
+    def verify_ngram(self, logits: torch.Tensor, seqs: list[Sequence], temperatures: torch.Tensor):
+        """Refer to the verification logic in the draft model verification function."""
+        # verify_res will be sent to the sub-process in the target group.
+        num_seqs = len(seqs)
+        lengths = torch.empty(2 * num_seqs, dtype=torch.int32, device="cuda")
+        dist.broadcast(lengths, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        to_be_verified_len = lengths[:num_seqs].tolist()
+        next_round_len = lengths[num_seqs:].tolist()
+        num_to_be_verified_tokens = sum(to_be_verified_len)
+        num_next_round_input = sum(next_round_len)
+        total_num = num_to_be_verified_tokens + num_next_round_input
+        msg = torch.empty(total_num, dtype=torch.int64, device="cuda")
+        dist.broadcast(msg, src=self.global_config.draft_config.master_rank, group=self.verify_group)
+        to_be_verified_tokens = msg[:num_to_be_verified_tokens].tolist()
+        next_round_input = msg[num_to_be_verified_tokens:].tolist()
+
+        verify_res = torch.zeros((4, len(seqs)), dtype=torch.int64, device="cuda")
+
+        if self.tp_params.local_rank == 0:
+            r = torch.rand(num_to_be_verified_tokens, device="cuda")
+            target_logits = norm_logits(logits, temperatures)
+            target_prob = target_logits.gather(dim=1, index=msg[:num_to_be_verified_tokens].unsqueeze(1)).squeeze(1)
+            judge = (r <= target_prob).tolist()
+
+            # keep original logic; add logs around sampling
+            logits.scatter_(1, msg[:num_to_be_verified_tokens].unsqueeze(1), -float("inf"))
+            revised_tokens = self.sampler(logits, temperatures)
+
+            acc, rollout, revise_token, finish = [], [], [], []
+
+            v_idx = 0
+            for i, seq in enumerate(seqs):
+                if seq.pre_verify:
+                    acc.append(judge[v_idx])
+                    # rollout is place holder when pre-verify
+                    rollout.append(0 if judge[v_idx] else next_round_len[i])
+                    revise_token.append(revised_tokens[v_idx])
+
+                    if judge[v_idx]:
+                        seq.cur_acc_tokens += 1
+                        finish.append((not seq.ignore_eos and is_eos(to_be_verified_tokens[v_idx], self.scheduler.eos)) or seq.num_completion_tokens >= seq.max_tokens - 1)
+                    else:
+                        seq.num_acc_tokens.append(seq.cur_acc_tokens + 1)
+                        seq.cur_acc_tokens = 0
+                        finish.append((not seq.ignore_eos and is_eos(revise_token[-1], self.scheduler.eos)) or seq.num_completion_tokens >= seq.max_tokens - 1)
+                else:
+                    n = to_be_verified_len[i]
+                    finish_flag = False
+                    for j in range(v_idx, v_idx + to_be_verified_len[i]):
+                        if not seq.ignore_eos and judge[j] and is_eos(to_be_verified_tokens[j], self.scheduler.eos):
+                            finish_flag = True
+
+                        if not judge[j]:
+                            n = j - v_idx
+                            break
+                    acc.append(n == to_be_verified_len[i])
+                    rollout.append(to_be_verified_len[i] - n)
+                    revise_token.append(revised_tokens[n + v_idx] if n < to_be_verified_len[i] else -1)
+                    finish.append(finish_flag or seq.num_completion_tokens >= seq.max_tokens - min(n + 1, to_be_verified_len[i]))
+
+                    if n == to_be_verified_len[i]:
+                        seq.cur_acc_tokens += to_be_verified_len[i]
+                    else:
+                        seq.num_acc_tokens.append(seq.cur_acc_tokens + n + 1)
+                        seq.cur_acc_tokens = 0
+                    
+                v_idx += 1 if seq.pre_verify else self.gamma
+        
+            verify_res = torch.tensor([acc, rollout, revise_token, finish], dtype=torch.int64, device="cuda")
+        
+        dist.broadcast(verify_res, src=self.global_config.target_config.master_rank)
+
+        # post-process the seqs according to the verify_res.
+        acc, rollout, revise_token, finish = verify_res.tolist()
+
+        # next round prefix sum
+        next_round_offsets = []
+        offset = 0
+        for l in next_round_len:
+            next_round_offsets.append(offset)
+            offset += l
+
+        for idx, seq in enumerate(seqs):
+            
+            if seq.pre_verify:
+                if acc[idx]:
+                    seq.pre_verify = False
+                    seq.cur_drafted_tokens = next_round_len[idx]
+                    for token in next_round_input[next_round_offsets[idx]:next_round_offsets[idx]+next_round_len[idx]]:
+                        seq.append_token(token)
+                else:
+                    seq.pre_verify = True
+                    seq.append_token(revise_token[idx])
+            else:
+                if acc[idx]:
+                    seq.pre_verify = False
+                    seq.cur_drafted_tokens = next_round_len[idx]
+                    for token in next_round_input[next_round_offsets[idx]:next_round_offsets[idx]+next_round_len[idx]]:
                         seq.append_token(token)
                 else:
                     seq.pre_verify = True
