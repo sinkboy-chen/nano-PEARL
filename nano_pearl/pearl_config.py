@@ -3,7 +3,6 @@ from nano_pearl.utils.pearl_logger import logger, get_model_name
 from dataclasses import dataclass
 from transformers import AutoConfig
 import torch.distributed as dist
-from enum import Enum, auto
 
 
 @dataclass
@@ -68,30 +67,6 @@ class BaseConfig:
             self.hf_config.vocab_size = padded_vocab_size
 
 
-class NgramDraftMode(Enum):
-    """
-    Defines how Ngram-assisted speculative drafting is applied to the 
-    drafting stage of speculative decoding.
-    """
-    
-    # 1. Standard Speculative Decoding
-    OFF = auto()      
-    """Disables Ngram speedup. The draft model generates tokens 
-    traditionally without Ngram assistance."""
-
-    # 2. Fixed-length Speculative Step
-    STATIC = auto()   
-    """Ngram-assisted drafting. The draft model 
-    will always produce a draft of length exactly equal to 'gamma' 
-    by utilizing Ngram lookups."""
-
-    # 3. Variable-length Speculative Step
-    DYNAMIC = auto()  
-    """Ngram-assisted drafting where the total draft length is the 
-    sum of lengths produced over
-    gamma (ngram drafting + draft model verification) cycles."""
-
-
 @dataclass
 class PEARLConfig:
     draft_model_path: str
@@ -108,10 +83,12 @@ class PEARLConfig:
     num_kvcache_blocks: int = -1
     enforce_eager: bool = False
     gamma: int = -1
-    ngram_draft_mode: NgramDraftMode = NgramDraftMode.OFF
+    
+    ngram_speedup_drafting: bool = False
+    # only used when ngram_speedup_drafting
     ngram_n: int = -1
-    # only used in DYNAMIC mode
     max_ngram_draft_tokens: int = -1
+
     def __post_init__(self):
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
@@ -129,23 +106,19 @@ class PEARLConfig:
         logger.info(f"GPU_Memory_Utilization={self.gpu_memory_utilization}")
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
-        logger.info(f"Ngram_Draft_Mode={self.ngram_draft_mode.name}")
+        logger.info(f"Ngram_Speedup_Drafting={self.ngram_speedup_drafting}")
 
-        if self.ngram_draft_mode == NgramDraftMode.OFF:
+        if self.ngram_speedup_drafting:
             assert self.ngram_n == -1
+            assert self.max_ngram_draft_tokens == -1
         else:
+            # set default
             if self.ngram_n == -1:
-                # default as 3
                 self.ngram_n = 3
-            logger.info(f"Ngram_n={self.ngram_n}")
-
-        if self.ngram_draft_mode == NgramDraftMode.DYNAMIC:
-            if self.max_ngram_draft_tokens==-1:
-                # default as 10
+            if self.max_ngram_draft_tokens == -1:
                 self.max_ngram_draft_tokens = 10
+            logger.info(f"Ngram_n={self.ngram_n}")
             logger.info(f"Max_Ngram_Draft_tokens={self.max_ngram_draft_tokens}")
-        else:
-            assert self.max_ngram_draft_tokens==-1
 
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
