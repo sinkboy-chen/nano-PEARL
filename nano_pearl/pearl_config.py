@@ -108,7 +108,7 @@ class PEARLConfig:
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Ngram_Speedup_Drafting={self.ngram_speedup_drafting}")
 
-        if self.ngram_speedup_drafting:
+        if not self.ngram_speedup_drafting:
             assert self.ngram_n == -1
             assert self.max_ngram_draft_tokens == -1
         else:
