@@ -88,7 +88,8 @@ class NgramDraftMode(Enum):
     # 3. Variable-length Speculative Step
     DYNAMIC = auto()  
     """Ngram-assisted drafting where the total draft length is the 
-    sum of lengths produced over gamma drafting cycles."""
+    sum of lengths produced over
+    gamma (ngram drafting + draft model verification) cycles."""
 
 
 @dataclass
@@ -108,6 +109,9 @@ class PEARLConfig:
     enforce_eager: bool = False
     gamma: int = -1
     ngram_draft_mode: NgramDraftMode = NgramDraftMode.OFF
+    ngram_n: int = -1
+    # only used in DYNAMIC mode
+    max_ngram_draft_tokens: int = -1
     def __post_init__(self):
         logger.info("="*50)
         logger.info(f"Loading Draft Config:")
@@ -126,10 +130,26 @@ class PEARLConfig:
         logger.info(f"Enforce_Eager={self.enforce_eager}")
         logger.info(f"Gamma (Window_Size)={self.gamma}, [-1 means auto-set]")
         logger.info(f"Ngram_Draft_Mode={self.ngram_draft_mode.name}")
+
+        if self.ngram_draft_mode == NgramDraftMode.OFF:
+            assert self.ngram_n == -1
+        else:
+            if self.ngram_n == -1:
+                # default as 3
+                self.ngram_n = 3
+            logger.info(f"Ngram_n={self.ngram_n}")
+
+        if self.ngram_draft_mode == NgramDraftMode.DYNAMIC:
+            if self.max_ngram_draft_tokens==-1:
+                # default as 10
+                self.max_ngram_draft_tokens = 10
+            logger.info(f"Max_Ngram_Draft_tokens={self.max_ngram_draft_tokens}")
+        else:
+            assert self.max_ngram_draft_tokens==-1
+
         assert self.draft_config.eos == self.target_config.eos
         assert (self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size) <= 8
         assert self.max_num_batched_tokens >= self.max_model_len
         self.world_size = self.draft_config.tensor_parallel_size + self.target_config.tensor_parallel_size
         logger.info(f"World_Size={self.world_size}")
         logger.info("="*50)
-    
